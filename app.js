@@ -93,6 +93,8 @@
     for (const n of [3, 2, 1]) { stage.innerHTML = `<div class="countdown">${n}</div>`; await ctx.wait(700); }
   }
 
+  const TOUCH = window.matchMedia && matchMedia('(pointer: coarse)').matches;
+
   // ---------- Traits ----------
   // Each trait is a spectrum: neither end is "bad". Roles are loose suggestions for self-reflection.
   const TRAITS = [
@@ -252,7 +254,7 @@
       id: 'memory', title: 'Number Memory', icon: '🔢', mins: 3,
       steps: [
         'Numbers will flash one at a time.',
-        'When they finish, type the whole sequence in order.',
+        'When they finish, tap the numbers in the same order and press <b>OK</b>.',
         'Each correct answer makes the next sequence one number longer.',
         'The game ends after two misses in a row.',
       ],
@@ -266,12 +268,32 @@
           for (const n of seq) { d.textContent = n; await ctx.wait(750); d.textContent = ''; await ctx.wait(250); }
           stage.innerHTML = `
             <div class="hud"><span>Length <b>${len}</b></span><span>Best <b>${best > 2 ? best : '–'}</b></span></div>
-            <h3>Type the numbers in order</h3>
-            <form id="f" autocomplete="off"><input class="input digit-input" id="in" inputmode="numeric" pattern="[0-9]*" maxlength="15" autofocus>
-            <div class="btn-row"><button class="btn primary" type="submit">Submit</button></div></form>
+            <h3>Enter the numbers in order</h3>
+            <div class="entry" id="entry" aria-live="polite">&nbsp;</div>
+            <div class="keypad">
+              ${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((x) => `<button class="btn key" data-k="${x}">${x}</button>`).join('')}
+              <button class="btn key" data-k="del" aria-label="Delete">⌫</button>
+              <button class="btn key" data-k="0">0</button>
+              <button class="btn key primary" data-k="ok">OK</button>
+            </div>
             <div class="feedback" id="fb"></div>`;
-          const inp = $('#in', stage); inp.focus();
-          const answer = await new Promise((res) => ctx.listen($('#f', stage), 'submit', (e) => { e.preventDefault(); res(inp.value.replace(/\D/g, '')); }));
+          const answer = await new Promise((res) => {
+            let typed = '';
+            const entry = $('#entry', stage);
+            const press = (k) => {
+              if (k === 'ok') { if (typed) res(typed); return; }
+              if (k === 'del') typed = typed.slice(0, -1);
+              else if (typed.length < 15) typed += k;
+              entry.innerHTML = typed ? typed.split('').join(' ') : '&nbsp;';
+            };
+            stage.querySelectorAll('.key').forEach((b) => ctx.listen(b, 'click', () => press(b.dataset.k)));
+            ctx.listen(document, 'keydown', (e) => {
+              if (/^[0-9]$/.test(e.key)) press(e.key);
+              else if (e.key === 'Backspace') press('del');
+              else if (e.key === 'Enter') { e.preventDefault(); press('ok'); }
+            });
+          });
+          stage.querySelectorAll('.key').forEach((b) => { b.disabled = true; });
           trials++;
           const fb = $('#fb', stage);
           if (answer === seq.join('')) {
@@ -292,14 +314,14 @@
       id: 'gonogo', title: 'Stop & Go', icon: '🚦', mins: 2,
       steps: [
         'Circles will appear one at a time.',
-        'When the circle is <b style="color:var(--go)">GREEN</b>, press <b>Space</b> or tap the box as fast as you can.',
+        `When the circle is <b style="color:var(--go)">GREEN</b>, ${TOUCH ? '<b>tap the box</b>' : 'press <b>Space</b> or click the box'} as fast as you can.`,
         'When it is <b style="color:var(--stop)">RED</b>, do nothing.',
         'There are 40 circles. Be fast, but careful.',
       ],
       async run(ctx, stage) {
         const types = shuffle([...Array(30).fill('go'), ...Array(10).fill('stop')]);
         await countdown(ctx, stage);
-        stage.innerHTML = `<div class="hud"><span>Trial <b id="t">1</b>/${types.length}</span><span class="small">Space or tap</span></div><div class="gng-area" id="area"><span class="fix">+</span></div>`;
+        stage.innerHTML = `<div class="hud"><span>Trial <b id="t">1</b>/${types.length}</span><span class="small">${TOUCH ? 'Tap on green' : 'Space on green'}</span></div><div class="gng-area" id="area"><span class="fix">+</span></div>`;
         const area = $('#area', stage);
         let cur = null;
         const flash = (cls) => { area.classList.add(cls); setTimeout(() => area.classList.remove(cls), 180); };
@@ -390,36 +412,105 @@
       steps: [
         'You will read short situations about different people.',
         'Pick the emotion the person is <b>most likely</b> feeling.',
-        'Go with your gut — there are 12 situations.',
+        'Go with your gut — there are 12 situations, picked at random from a large pool.',
       ],
       async run(ctx, stage) {
-        const items = shuffle([
-          ['Aisha’s exam, which she had been dreading all week, is cancelled an hour before it starts.', 'Relieved', ['Proud', 'Surprised', 'Guilty']],
-          ['Ben’s teammate presents Ben’s idea to the manager as his own.', 'Angry', ['Embarrassed', 'Afraid', 'Sad']],
-          ['Chloe’s best friend wins the scholarship Chloe also applied for. Chloe forces a smile.', 'Jealous', ['Proud', 'Relieved', 'Grateful']],
-          ['Daniel accidentally sends a private complaint about his boss to the whole team chat.', 'Embarrassed', ['Angry', 'Jealous', 'Sad']],
-          ['Elena’s grandmother, who raised her, moves permanently to another country.', 'Sad', ['Angry', 'Relieved', 'Guilty']],
-          ['Farid crosses the finish line of his first marathon after a year of training.', 'Proud', ['Relieved', 'Surprised', 'Grateful']],
-          ['Grace’s colleague stays late, unasked, to help her fix a mistake before a deadline.', 'Grateful', ['Guilty', 'Proud', 'Relieved']],
-          ['Hari hears footsteps following him on an empty street late at night.', 'Afraid', ['Angry', 'Surprised', 'Embarrassed']],
-          ['Ivy forgot her friend’s birthday. The friend mentions she spent it alone.', 'Guilty', ['Sad', 'Embarrassed', 'Afraid']],
-          ['Jon takes a big sip of milk and realises it has gone sour.', 'Disgusted', ['Angry', 'Surprised', 'Sad']],
-          ['Kai walks into his flat and his friends jump out for a party he knew nothing about.', 'Surprised', ['Grateful', 'Embarrassed', 'Afraid']],
-          ['Lena is waiting for important medical test results that arrive tomorrow.', 'Anxious', ['Sad', 'Angry', 'Guilty']],
-        ]);
+        const COUNT = 12;
+        // {n} is replaced with a random name. [id, text, answer, [3 other options]]
+        const POOL = [
+          [1, '{n}’s exam, dreaded all week, is cancelled an hour before it starts.', 'Relieved', ['Proud', 'Surprised', 'Guilty']],
+          [2, '{n}’s teammate presents {n}’s idea to the manager as their own.', 'Angry', ['Embarrassed', 'Afraid', 'Sad']],
+          [3, '{n}’s best friend wins the scholarship {n} also applied for. {n} forces a smile.', 'Jealous', ['Proud', 'Relieved', 'Grateful']],
+          [4, '{n} accidentally sends a private complaint about the boss to the whole team chat.', 'Embarrassed', ['Angry', 'Jealous', 'Sad']],
+          [5, 'The grandmother who raised {n} moves permanently to another country.', 'Sad', ['Angry', 'Relieved', 'Guilty']],
+          [6, '{n} crosses the finish line of a first marathon after a year of training.', 'Proud', ['Relieved', 'Surprised', 'Grateful']],
+          [7, 'A colleague stays late, unasked, to help {n} fix a mistake before a deadline.', 'Grateful', ['Guilty', 'Proud', 'Relieved']],
+          [8, '{n} hears footsteps following close behind on an empty street late at night.', 'Afraid', ['Angry', 'Surprised', 'Embarrassed']],
+          [9, '{n} forgot a friend’s birthday. The friend mentions spending it alone.', 'Guilty', ['Sad', 'Embarrassed', 'Afraid']],
+          [10, '{n} takes a big sip of milk and realises it has gone sour.', 'Disgusted', ['Angry', 'Surprised', 'Sad']],
+          [11, '{n} walks in the door and friends jump out for a party {n} knew nothing about.', 'Surprised', ['Grateful', 'Embarrassed', 'Afraid']],
+          [12, '{n} is waiting for important medical test results that arrive tomorrow.', 'Anxious', ['Sad', 'Angry', 'Guilty']],
+          [13, 'After refreshing all morning, the concert tickets sell out just before {n} reaches the front of the queue.', 'Disappointed', ['Afraid', 'Guilty', 'Embarrassed']],
+          [14, '{n} moved to a new city a month ago and spends another weekend with nobody to message.', 'Lonely', ['Angry', 'Guilty', 'Proud']],
+          [15, 'For the third time today, {n}’s laptop freezes and loses unsaved work.', 'Frustrated', ['Sad', 'Afraid', 'Embarrassed']],
+          [16, 'While cleaning a cupboard, {n} finds an old photo album from primary school.', 'Nostalgic', ['Guilty', 'Anxious', 'Jealous']],
+          [17, 'After months of job hunting, {n} is invited to a final-round interview.', 'Hopeful', ['Guilty', 'Lonely', 'Disgusted']],
+          [18, '{n} followed the assembly instructions exactly, but the shelf looks nothing like the picture.', 'Confused', ['Afraid', 'Guilty', 'Jealous']],
+          [19, '{n} has been stuck in a two-hour meeting that has nothing to do with {n}’s work.', 'Bored', ['Anxious', 'Guilty', 'Proud']],
+          [20, 'It’s the night before {n}’s first ever trip overseas, and the bag is finally packed.', 'Excited', ['Guilty', 'Bored', 'Disgusted']],
+          [21, '{n} is caught copying a classmate’s homework in front of the whole class.', 'Ashamed', ['Proud', 'Bored', 'Lonely']],
+          [22, '{n} overhears close friends mocking {n}’s appearance when they think no one is listening.', 'Hurt', ['Proud', 'Bored', 'Relieved']],
+          [23, 'On a quiet Sunday, {n} sips coffee on the balcony with nothing urgent to do.', 'Content', ['Anxious', 'Jealous', 'Guilty']],
+          [24, '{n}’s younger brother breaks {n}’s new phone on purpose during an argument.', 'Angry', ['Proud', 'Grateful', 'Bored']],
+          [25, 'A stranger in the lift keeps staring at {n} without saying a word.', 'Uneasy', ['Proud', 'Grateful', 'Bored']],
+          [26, '{n} lost a wallet this morning. A stranger returns it with everything still inside.', 'Grateful', ['Guilty', 'Jealous', 'Afraid']],
+          [27, '{n}’s phone dies just as {n} needs the map to find a job-interview venue.', 'Panicked', ['Bored', 'Proud', 'Content']],
+          [28, '{n}’s flight home for the holidays is cancelled, and the next one is in four days.', 'Disappointed', ['Proud', 'Relieved', 'Bored']],
+          [29, '{n} makes the final payment on a study loan that took six years to clear.', 'Relieved', ['Jealous', 'Guilty', 'Bored']],
+          [30, 'A coworker with far less experience is promoted over {n}.', 'Resentful', ['Grateful', 'Relieved', 'Content']],
+          [31, '{n}’s dog of twelve years passes away in the night.', 'Grieving', ['Angry', 'Guilty', 'Surprised']],
+          [32, '{n} sees photos of a friends’ holiday that {n} wasn’t invited to.', 'Left out', ['Proud', 'Relieved', 'Disgusted']],
+          [33, '{n} finds a long hair in a bowl of restaurant soup.', 'Disgusted', ['Sad', 'Afraid', 'Guilty']],
+          [34, '{n} is about to walk on stage to give a speech to 500 people.', 'Nervous', ['Bored', 'Guilty', 'Content']],
+          [35, '{n}’s mentor praises {n}’s work in front of the whole company.', 'Proud', ['Guilty', 'Anxious', 'Jealous']],
+          [36, '{n} snapped at a friend over something small and now can’t sleep thinking about it.', 'Regretful', ['Proud', 'Bored', 'Excited']],
+          [37, '{n}’s parents suddenly announce they are divorcing after 25 years.', 'Shocked', ['Bored', 'Proud', 'Content']],
+          [38, 'For the fifth time, {n} explains the problem to customer service — and gets transferred again.', 'Frustrated', ['Afraid', 'Guilty', 'Nostalgic']],
+          [39, '{n} realises it’s the wrong wedding reception after chatting with the guests for 20 minutes.', 'Embarrassed', ['Proud', 'Lonely', 'Disgusted']],
+          [40, '{n} reads about a stranger who paid for a struggling family’s groceries.', 'Touched', ['Jealous', 'Bored', 'Afraid']],
+          [41, 'The company will announce layoffs next week, but no one has said who.', 'Anxious', ['Excited', 'Proud', 'Content']],
+          [42, 'After weeks of practice, {n} finally plays the whole song without a single mistake.', 'Satisfied', ['Guilty', 'Lonely', 'Afraid']],
+          [43, '{n}’s friend cancels their plans at the last minute — for the third time this month.', 'Annoyed', ['Grateful', 'Afraid', 'Proud']],
+          [44, 'A childhood best friend {n} hasn’t heard from in ten years suddenly calls.', 'Surprised', ['Guilty', 'Disgusted', 'Bored']],
+          [45, 'A large cockroach runs across the kitchen counter right next to {n}’s dinner.', 'Disgusted', ['Sad', 'Jealous', 'Proud']],
+          [46, '{n} felt great about a test, then gets back the lowest mark in the class.', 'Disappointed', ['Proud', 'Relieved', 'Grateful']],
+          [47, '{n} is stuck at home sick, scrolling through friends’ beach photos.', 'Envious', ['Relieved', 'Proud', 'Grateful']],
+          [48, 'The doctor tells {n} that the lump they were worried about is harmless.', 'Relieved', ['Guilty', 'Jealous', 'Bored']],
+          [49, '{n} arrives at a party where everyone is chatting in small groups and {n} knows nobody.', 'Awkward', ['Proud', 'Grateful', 'Angry']],
+          [50, '{n} watches a younger sister graduate — the first in the family to finish university.', 'Proud', ['Jealous', 'Guilty', 'Afraid']],
+          [51, 'An online seller takes {n}’s money and never sends the item.', 'Angry', ['Grateful', 'Proud', 'Content']],
+          [52, '{n}’s manager says, “Can you come to my office?” — with no explanation.', 'Nervous', ['Excited', 'Proud', 'Content']],
+          [53, '{n} visits a hometown and sees the old primary school has been demolished.', 'Nostalgic', ['Angry', 'Proud', 'Excited']],
+          [54, 'A bouquet of flowers arrives for {n} at work — from an unknown sender.', 'Curious', ['Guilty', 'Angry', 'Bored']],
+          [55, 'Halfway to the airport, {n} can’t remember locking the front door.', 'Worried', ['Proud', 'Bored', 'Grateful']],
+          [56, '{n} receives a text meant for someone else, full of harsh complaints about {n}.', 'Hurt', ['Excited', 'Grateful', 'Bored']],
+          [57, '{n}’s team loses the final with the last kick of the game.', 'Disappointed', ['Relieved', 'Grateful', 'Bored']],
+          [58, '{n} is praised for a project that a teammate mostly did.', 'Guilty', ['Proud', 'Bored', 'Angry']],
+          [59, 'Watching a horror film alone at midnight, {n} hears something move in the kitchen.', 'Scared', ['Bored', 'Proud', 'Grateful']],
+          [60, '{n} has spent eight hours copying numbers from one spreadsheet to another.', 'Bored', ['Afraid', 'Guilty', 'Jealous']],
+          [61, 'A former student sends {n} a handwritten letter saying {n} changed their life.', 'Touched', ['Jealous', 'Afraid', 'Bored']],
+          [62, '{n} studied hard, but the exam covers chapters the lecturer said wouldn’t be tested.', 'Frustrated', ['Grateful', 'Proud', 'Nostalgic']],
+          [63, '{n}’s small business gets its very first online order from a stranger.', 'Excited', ['Guilty', 'Lonely', 'Disgusted']],
+          [64, 'Everyone else at the table understands the inside joke. {n} laughs along, not getting it.', 'Left out', ['Proud', 'Relieved', 'Disgusted']],
+          [65, '{n} trips and falls in front of a crowded café.', 'Embarrassed', ['Jealous', 'Grateful', 'Lonely']],
+          [66, '{n} learns a close friend has been keeping a big secret from {n} for a year.', 'Betrayed', ['Relieved', 'Bored', 'Proud']],
+        ];
+        const NAMES = ['Aisha', 'Ben', 'Chloe', 'Daniel', 'Elena', 'Farid', 'Grace', 'Hari', 'Ivy', 'Jon', 'Kai', 'Lena', 'Mei Ling', 'Arjun',
+          'Siti', 'Wei Jie', 'Priya', 'Marcus', 'Nurul', 'Ryan', 'Sofia', 'Tom', 'Yuki', 'Zara', 'Amir', 'Hannah', 'Kumar', 'Li Na', 'Sarah', 'Irfan'];
+        // Prefer situations this player hasn't seen before; start over once they've seen them all.
+        const seen = new Set((state && state.seen && state.seen.emotion) || []);
+        let fresh = shuffle(POOL.filter((q) => !seen.has(q[0])));
+        if (fresh.length < COUNT) { seen.clear(); fresh = fresh.concat(shuffle(POOL.filter((q) => !fresh.includes(q)))); }
+        const items = fresh.slice(0, COUNT);
+        const names = shuffle(NAMES.slice());
         let correct = 0; const rts = [];
         for (let k = 0; k < items.length; k++) {
-          const [text, ans, others] = items[k];
+          const [, tpl, ans, others] = items[k];
+          const text = tpl.replaceAll('{n}', names[k % names.length]);
           const opts = shuffle([ans, ...others]);
           stage.innerHTML = `
             <div class="hud"><span>Situation <b>${k + 1}</b>/${items.length}</span></div>
             <p class="scenario">${esc(text)}</p>
-            <div class="choices">${opts.map((o) => `<button class="btn" data-v="${o}">${o}</button>`).join('')}</div>`;
+            <div class="choices">${opts.map((o) => `<button class="btn" data-v="${esc(o)}">${esc(o)}</button>`).join('')}</div>`;
           const t0 = performance.now();
           const pick = await choose(ctx, stage, '.choices .btn');
           rts.push(performance.now() - t0);
           if (pick === ans) correct++;
           await ctx.wait(150);
+        }
+        if (state) {
+          state.seen = state.seen || {};
+          state.seen.emotion = [...seen, ...items.map((q) => q[0])];
         }
         return {
           scores: { emotion: Math.round((correct / items.length) * 100) },
@@ -432,7 +523,7 @@
       steps: [
         `Each round, choose an <b>Easy</b> task (${money(1)}) or a <b>Hard</b> task (bigger reward).`,
         'Easy: 15 taps in 6 seconds. Hard: 45 taps in 15 seconds.',
-        'Tap the big button or press <b>Space</b>.',
+        TOUCH ? 'Tap the big button as fast as you can.' : 'Click the big button or press <b>Space</b>.',
         'Each round shows the chance of actually getting paid if you finish. 6 rounds.',
       ],
       async run(ctx, stage) {

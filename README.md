@@ -9,7 +9,7 @@ A pymetrics-style self-discovery site: 8 short behavioural games that build a pr
 | 🔢 Number Memory | Working memory |
 | 🚦 Stop & Go | Self-control, focus & speed |
 | 🗼 Tower Builder | Planning |
-| 🎭 Read the Room | Emotional insight |
+| 🎭 Read the Room | Emotional insight (12 random situations from a pool of 66, no repeats until all are seen) |
 | ⚡ Tap Challenge | Drive / effort |
 | ⏳ Now or Later | Patience |
 
