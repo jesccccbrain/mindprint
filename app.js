@@ -1,5 +1,5 @@
 /* MindPrint — behavioural games that build a trait profile.
-   Plain JavaScript, no build step. Results are saved in the browser (localStorage). */
+   Plain JavaScript, no build step. Results are saved online (Firebase, see config.js) or on the device. */
 (() => {
   'use strict';
 
@@ -17,53 +17,142 @@
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const $ = (sel, root = document) => root.querySelector(sel);
 
-  // ---------- Storage: private profiles (name + PIN) ----------
-  // db = { people: { id: { id, name, key, salt, pin, results, created } } }
-  // Nobody is logged in when the page opens; the session lives only in this tab (sessionStorage).
-  function saveDb() { try { localStorage.setItem(STORE_KEY, JSON.stringify(db)); } catch (e) { /* storage unavailable */ } }
-  function loadDb() { try { return JSON.parse(localStorage.getItem(STORE_KEY)); } catch (e) { return null; } }
-  const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 9);
-  const nameKey = (s) => s.trim().replace(/\s+/g, ' ').toLowerCase();
-  let db = loadDb() || { people: {} };
-  if (!db.people) db.people = {};
-  delete db.current;
-  try { localStorage.removeItem('mindprint.v1'); } catch (e) { /* ignore */ }
-  // Profiles from older versions have no PIN; they are removed so every profile is protected.
-  for (const [id, p] of Object.entries(db.people)) if (!p.pin) delete db.people[id];
-  saveDb();
+  // ---------- Storage ----------
+  // Two back-ends with the same interface:
+  //  • Online (Firebase) when config.js has a Firebase config — results saved in the cloud, admin page available.
+  //  • On-device (localStorage) otherwise.
+  // A participant object looks like: { id, name, results: { gameId: {scores, raw, at} }, seen: {}, created }
+  const CFG = window.MINDPRINT_CONFIG || {};
+  const ONLINE = !!(CFG.firebase && CFG.firebase.apiKey);
+  const GAME_IDS = ['balloon', 'trust', 'memory', 'gonogo', 'hanoi', 'emotion', 'effort', 'delay'];
+  const cleanName = (s) => s.trim().replace(/\s+/g, ' ');
+  const nameKey = (s) => cleanName(s).toLowerCase();
+  const NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N} .'\-]{1,29}$/u;
 
-  async function hashPin(pin, salt) {
-    const text = salt + ':' + pin;
-    if (window.crypto && crypto.subtle) {
-      const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-      return Array.from(new Uint8Array(buf)).map((x) => x.toString(16).padStart(2, '0')).join('');
+  function makeLocalStore() {
+    const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 9);
+    const saveDb = () => { try { localStorage.setItem(STORE_KEY, JSON.stringify(db)); } catch (e) { /* storage unavailable */ } };
+    let db = null;
+    try { db = JSON.parse(localStorage.getItem(STORE_KEY)); } catch (e) { /* ignore */ }
+    db = db || { people: {} };
+    if (!db.people) db.people = {};
+    delete db.current;
+    for (const [id, p] of Object.entries(db.people)) if (!p.pin) delete db.people[id];
+    try { localStorage.removeItem('mindprint.v1'); } catch (e) { /* ignore */ }
+    saveDb();
+    async function hashPin(pin, salt) {
+      const text = salt + ':' + pin;
+      if (window.crypto && crypto.subtle) {
+        const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+        return Array.from(new Uint8Array(buf)).map((x) => x.toString(16).padStart(2, '0')).join('');
+      }
+      let h = 0; for (let i = 0; i < text.length; i++) h = (Math.imul(31, h) + text.charCodeAt(i)) | 0;
+      return 'x' + (h >>> 0).toString(16);
     }
-    let h = 0; for (let i = 0; i < text.length; i++) h = (Math.imul(31, h) + text.charCodeAt(i)) | 0;
-    return 'x' + (h >>> 0).toString(16);
+    const find = (name) => Object.values(db.people).find((p) => p.key === nameKey(name));
+    const setSession = (id) => { try { if (id) sessionStorage.setItem('mindprint.session', id); else sessionStorage.removeItem('mindprint.session'); } catch (e) { /* ignore */ } };
+    return {
+      online: false,
+      async init() {
+        let sid = null; try { sid = sessionStorage.getItem('mindprint.session'); } catch (e) { /* ignore */ }
+        return (sid && db.people[sid]) || null;
+      },
+      async create(name, pin) {
+        if (find(name)) return { error: 'taken' };
+        const id = newId(), salt = newId();
+        db.people[id] = { id, name: cleanName(name), key: nameKey(name), salt, pin: await hashPin(pin, salt), results: {}, seen: {}, created: Date.now() };
+        saveDb(); setSession(id);
+        return { person: db.people[id] };
+      },
+      async login(name, pin) {
+        const p = find(name);
+        if (!p || (await hashPin(pin, p.salt)) !== p.pin) return { error: 'wrong' };
+        setSession(p.id); return { person: p };
+      },
+      async logout() { setSession(null); },
+      async saveResult(p, id, res) {
+        if (p.results[id]) return;           // results are locked once played
+        p.results[id] = res; saveDb();
+      },
+      async adminLogin() { return { error: 'offline' }; },
+      async listAll() { return []; },
+    };
   }
-  const findByName = (name) => Object.values(db.people).find((p) => p.key === nameKey(name));
 
+  function makeFirebaseStore() {
+    let auth, fs;
+    const EMAIL_DOMAIN = 'players.mindprint.app';
+    // Turn a display name into the unique login e-mail Firebase needs (never shown or e-mailed).
+    const nameToEmail = (name) => [...nameKey(name)].map((c) => (/[a-z0-9]/.test(c) ? c : '_' + c.codePointAt(0).toString(16))).join('') + '@' + EMAIL_DOMAIN;
+    const pinToPassword = (pin) => 'mp-' + pin + '-mindprint';
+    const toPerson = (id, d) => ({ id, name: d.name, results: d.results || {}, seen: d.seen || {}, created: d.createdAt && d.createdAt.toMillis ? d.createdAt.toMillis() : Date.now() });
+    const loadScript = (src) => new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => rej(new Error('load ' + src)); document.head.appendChild(s); });
+    const errOf = (e) => {
+      const c = (e && e.code) || '';
+      if (c.includes('email-already-in-use')) return 'taken';
+      if (c.includes('invalid-credential') || c.includes('wrong-password') || c.includes('user-not-found') || c.includes('invalid-login')) return 'wrong';
+      if (c.includes('too-many-requests')) return 'slow';
+      if (c.includes('network')) return 'network';
+      return 'other';
+    };
+    return {
+      online: true,
+      isAdmin: false,
+      async init() {
+        const v = CFG.firebaseVersion || '12.19.0';
+        const base = `https://www.gstatic.com/firebasejs/${v}/`;
+        await loadScript(base + 'firebase-app-compat.js');
+        await Promise.all([loadScript(base + 'firebase-auth-compat.js'), loadScript(base + 'firebase-firestore-compat.js')]);
+        firebase.initializeApp(CFG.firebase);
+        auth = firebase.auth(); fs = firebase.firestore();
+        if (CFG.useEmulator) { auth.useEmulator('http://127.0.0.1:9099', { disableWarnings: true }); fs.useEmulator('127.0.0.1', 8080); }
+        await auth.setPersistence(firebase.auth.Auth.Persistence.SESSION); // closing the tab logs out
+        const user = await new Promise((res) => { const off = auth.onAuthStateChanged((u) => { off(); res(u); }); });
+        if (!user) return null;
+        if (user.uid === CFG.adminUid) { this.isAdmin = true; return null; }
+        const snap = await fs.collection('participants').doc(user.uid).get();
+        return snap.exists ? toPerson(user.uid, snap.data()) : null;
+      },
+      async create(name, pin) {
+        try {
+          const cred = await auth.createUserWithEmailAndPassword(nameToEmail(name), pinToPassword(pin));
+          const data = { name: cleanName(name), nameKey: nameKey(name), createdAt: firebase.firestore.FieldValue.serverTimestamp(), results: {}, seen: {} };
+          await fs.collection('participants').doc(cred.user.uid).set(data);
+          this.isAdmin = false;
+          return { person: toPerson(cred.user.uid, { ...data, createdAt: null }) };
+        } catch (e) { return { error: errOf(e) }; }
+      },
+      async login(name, pin) {
+        try {
+          const cred = await auth.signInWithEmailAndPassword(nameToEmail(name), pinToPassword(pin));
+          const snap = await fs.collection('participants').doc(cred.user.uid).get();
+          if (!snap.exists) { await auth.signOut(); return { error: 'wrong' }; }
+          this.isAdmin = false;
+          return { person: toPerson(cred.user.uid, snap.data()) };
+        } catch (e) { return { error: errOf(e) }; }
+      },
+      async logout() { this.isAdmin = false; await auth.signOut(); },
+      async saveResult(p, id, res) {
+        // The database rules only allow ADDING a game result, never changing or removing one.
+        await fs.collection('participants').doc(p.id).update({ ['results.' + id]: res, seen: p.seen || {} });
+        p.results[id] = res;
+      },
+      async adminLogin(email, password) {
+        try {
+          const cred = await auth.signInWithEmailAndPassword(email, password);
+          if (cred.user.uid !== CFG.adminUid) { await auth.signOut(); return { error: 'notadmin' }; }
+          this.isAdmin = true; return {};
+        } catch (e) { return { error: errOf(e) }; }
+      },
+      async listAll() {
+        const snap = await fs.collection('participants').get();
+        return snap.docs.map((d) => toPerson(d.id, d.data())).sort((a, b) => b.created - a.created);
+      },
+    };
+  }
+
+  const Store = ONLINE ? makeFirebaseStore() : makeLocalStore();
   let state = null; // the logged-in participant
-  try { const sid = sessionStorage.getItem('mindprint.session'); if (sid && db.people[sid]) state = db.people[sid]; } catch (e) { /* ignore */ }
-  const save = saveDb;
-  function setSession(p) {
-    state = p;
-    try { if (p) sessionStorage.setItem('mindprint.session', p.id); else sessionStorage.removeItem('mindprint.session'); } catch (e) { /* ignore */ }
-  }
-  async function createProfile(name, pin) {
-    if (findByName(name)) return false;
-    const id = newId(), salt = newId();
-    db.people[id] = { id, name: name.trim().replace(/\s+/g, ' '), key: nameKey(name), salt, pin: await hashPin(pin, salt), results: {}, created: Date.now() };
-    saveDb(); setSession(db.people[id]);
-    return true;
-  }
-  async function login(name, pin) {
-    const p = findByName(name);
-    if (!p || (await hashPin(pin, p.salt)) !== p.pin) return false;
-    setSession(p); return true;
-  }
-  function logout() { setSession(null); }
-  function deleteProfile(p) { delete db.people[p.id]; saveDb(); setSession(null); }
 
   // Every screen change bumps runId; running games notice and stop.
   let runId = 0;
@@ -614,15 +703,24 @@
     teardown();
     window.scrollTo(0, 0);
     if (needsLogin.includes(name) && !state) name = 'home';
+    if (name !== 'admin' && name !== 'adminView' && location.hash === '#admin') history.replaceState(null, '', location.pathname + location.search);
     renderNav();
-    ({ home, hub, intro, play, results })[name](arg);
+    ({ home, hub, intro, play, results, admin, adminView })[name](arg);
   }
   function renderNav() {
     $('#nav-games').hidden = !state;
     $('#nav-profile').hidden = !state;
-    $('#nav-logout').hidden = !state;
+    $('#nav-logout').hidden = !state && !Store.isAdmin;
   }
+  async function doLogout() { await Store.logout(); state = null; }
   const doneCount = (p) => GAMES.filter((g) => p.results[g.id]).length;
+  const AUTH_ERRORS = {
+    taken: (n) => `The name “${esc(n)}” is already taken. Please choose a different name, or log in if it’s yours.`,
+    wrong: () => 'Name or PIN is incorrect.',
+    slow: () => 'Too many attempts. Please wait a few minutes and try again.',
+    network: () => 'No internet connection. Please check your connection and try again.',
+    other: () => 'Something went wrong. Please try again.',
+  };
 
   function home(tab) {
     if (state) { show('hub'); return; }
@@ -637,33 +735,40 @@
             <button class="tab ${tab === 'login' ? 'active' : ''}" data-tab="login" role="tab">Log in</button>
           </div>
           <form id="auth" autocomplete="off">
-            <label>Name<input class="input" id="name" maxlength="40" required autocomplete="off"></label>
+            <label>Name<input class="input" id="name" maxlength="30" required autocomplete="off"></label>
             <label>PIN (4–6 digits)<input class="input" id="pin" type="password" inputmode="numeric" pattern="[0-9]{4,6}" minlength="4" maxlength="6" required autocomplete="off"></label>
             ${tab === 'new' ? '<label>Confirm PIN<input class="input" id="pin2" type="password" inputmode="numeric" maxlength="6" required autocomplete="off"></label>' : ''}
             <div class="feedback bad" id="err"></div>
-            <button class="btn primary big" type="submit">${tab === 'new' ? 'Create profile & start' : 'Log in'}</button>
+            <button class="btn primary big" type="submit" id="authBtn">${tab === 'new' ? 'Create profile & start' : 'Log in'}</button>
           </form>
-          <p class="muted small" style="margin:12px 0 0">${tab === 'new' ? 'Your PIN keeps your profile private. Remember it — it can’t be recovered.' : 'Log in to see your own profile or continue your games.'}</p>
+          <p class="muted small" style="margin:12px 0 0">${tab === 'new' ? 'Your PIN keeps your profile private. Remember your name and PIN — you’ll need both to see your results again.' : 'Log in to see your own profile or continue your games.'}</p>
         </div>
       </section>
       <section class="steps">
         <div class="card step"><div class="num">1</div><h3>Create your profile</h3><p class="muted">Pick a name and a PIN. Only you can open your results.</p></div>
-        <div class="card step"><div class="num">2</div><h3>Play the games</h3><p class="muted">Pump balloons, remember numbers, build towers and make money decisions.</p></div>
+        <div class="card step"><div class="num">2</div><h3>Play the games</h3><p class="muted">Each game can be played once — your first answers are the real you.</p></div>
         <div class="card step"><div class="num">3</div><h3>See your traits</h3><p class="muted">Get a profile of 9 traits and role ideas that fit your pattern.</p></div>
       </section>`;
     const ctx = makeCtx();
     app.querySelectorAll('.tab').forEach((t) => ctx.listen(t, 'click', () => show('home', t.dataset.tab)));
-    const err = $('#err');
+    const err = $('#err'), btn = $('#authBtn');
     ctx.listen($('#auth'), 'submit', async (e) => {
       e.preventDefault();
-      const name = $('#name').value.trim(), pin = $('#pin').value;
+      const name = cleanName($('#name').value), pin = $('#pin').value;
       err.textContent = '';
-      if (!name) { err.textContent = 'Please enter your name.'; return; }
+      if (!NAME_RE.test(name)) { err.textContent = 'Name must be 2–30 letters or numbers (spaces, dots, dashes and apostrophes are OK).'; return; }
       if (!/^[0-9]{4,6}$/.test(pin)) { err.textContent = 'PIN must be 4–6 digits.'; return; }
-      if (tab === 'new') {
-        if ($('#pin2').value !== pin) { err.textContent = 'The two PINs don’t match.'; return; }
-        if (!(await createProfile(name, pin))) { err.textContent = `The name “${name}” is already taken. Please choose a different name, or log in if it’s yours.`; return; }
-      } else if (!(await login(name, pin))) { err.textContent = 'Name or PIN is incorrect.'; $('#pin').value = ''; return; }
+      if (tab === 'new' && $('#pin2').value !== pin) { err.textContent = 'The two PINs don’t match.'; return; }
+      btn.disabled = true; btn.textContent = 'Please wait…';
+      const r = tab === 'new' ? await Store.create(name, pin) : await Store.login(name, pin);
+      if (!ctx.alive()) return;
+      if (r.error) {
+        err.innerHTML = (AUTH_ERRORS[r.error] || AUTH_ERRORS.other)(name);
+        btn.disabled = false; btn.textContent = tab === 'new' ? 'Create profile & start' : 'Log in';
+        if (tab === 'login') $('#pin').value = '';
+        return;
+      }
+      state = r.person;
       show(tab === 'login' && doneCount(state) ? 'results' : 'hub');
     });
     $('#name').focus();
@@ -674,32 +779,37 @@
     app.innerHTML = `
       <div class="hub-head">
         <div><h2>Hi ${esc(state.name)}, pick a game</h2>
-        <p class="muted">${done}/${GAMES.length} completed. Finish all of them for the fullest profile.</p></div>
+        <p class="muted">${done}/${GAMES.length} completed. Each game can be played once. Finish all of them for the fullest profile.</p></div>
         <button class="btn ${done ? 'primary' : ''}" id="toProfile" ${done ? '' : 'disabled'}>See my profile</button>
       </div>
       <div class="progress"><div style="width:${(done / GAMES.length) * 100}%"></div></div>
       <div class="game-grid">
-        ${GAMES.map((g) => `
-          <button class="card game-card" data-id="${g.id}">
+        ${GAMES.map((g) => {
+          const isDone = !!state.results[g.id];
+          return `
+          <button class="card game-card ${isDone ? 'locked' : ''}" data-id="${g.id}" ${isDone ? 'disabled aria-disabled="true"' : ''}>
             <span class="icon">${g.icon}</span>
             <h3>${g.title}</h3>
             <div class="meta"><span class="muted small">~${g.mins} min</span>
-            <span class="pill ${state.results[g.id] ? 'done' : ''}">${state.results[g.id] ? 'Done · replay' : 'Not played'}</span></div>
-          </button>`).join('')}
+            <span class="pill ${isDone ? 'done' : ''}">${isDone ? 'Done ✓' : 'Not played'}</span></div>
+          </button>`;
+        }).join('')}
       </div>
       <div class="btn-row"><button class="link" id="notme">Not ${esc(state.name)}? Log out</button></div>`;
     const ctx = makeCtx();
-    app.querySelectorAll('.game-card').forEach((c) => ctx.listen(c, 'click', () => show('intro', c.dataset.id)));
+    app.querySelectorAll('.game-card:not(.locked)').forEach((c) => ctx.listen(c, 'click', () => show('intro', c.dataset.id)));
     ctx.listen($('#toProfile'), 'click', () => show('results'));
-    ctx.listen($('#notme'), 'click', () => { logout(); show('home', 'login'); });
+    ctx.listen($('#notme'), 'click', async () => { await doLogout(); show('home', 'login'); });
   }
 
   function intro(id) {
+    if (state.results[id]) { show('hub'); return; }
     const g = GAMES.find((x) => x.id === id);
     app.innerHTML = `
       <div class="game-shell"><div class="card">
         <div class="game-title"><span class="icon">${g.icon}</span><div><h2 style="margin:0">${g.title}</h2><span class="muted small">~${g.mins} min</span></div></div>
         <div class="instructions"><b>How to play</b><ul>${g.steps.map((s) => `<li>${s}</li>`).join('')}</ul></div>
+        <p class="muted small">You can only play this game once, so read the instructions carefully.</p>
         <div class="btn-row"><button class="btn" id="back">Back</button><button class="btn primary big" id="go">Start</button></div>
       </div></div>`;
     const ctx = makeCtx();
@@ -708,6 +818,7 @@
   }
 
   async function play(id) {
+    if (state.results[id]) { show('hub'); return; }
     const g = GAMES.find((x) => x.id === id);
     const player = state;
     app.innerHTML = `
@@ -717,18 +828,27 @@
       </div>
       <div class="btn-row no-print"><button class="link" id="quit">Quit game</button></div></div>`;
     const ctx = makeCtx();
-    ctx.listen($('#quit'), 'click', () => show('hub'));
+    ctx.listen($('#quit'), 'click', () => { if (confirm('Quit this game? Your progress in this game will be lost.')) show('hub'); });
     const stage = $('#stage');
     const res = await g.run(ctx, stage);
     if (!ctx.alive() || state !== player) return;
-    state.results[id] = { ...res, at: Date.now() };
-    save();
+    $('#quit').hidden = true;
+    const result = { ...res, at: Date.now() };
+    // Save (retry if the connection drops)
+    while (true) {
+      stage.innerHTML = '<p class="muted">Saving your result…</p>';
+      try { await Store.saveResult(state, id, result); break; } catch (e) {
+        stage.innerHTML = `<h3>Couldn’t save your result</h3><p class="muted">Please check your internet connection. Don’t close this page.</p>
+          <div class="btn-row"><button class="btn primary" id="retry">Try again</button></div>`;
+        await choose(ctx, stage, '#retry');
+      }
+    }
     const next = GAMES.find((x) => !state.results[x.id]);
     const traitNames = Object.keys(res.scores).map((t) => TRAITS.find((x) => x.id === t).name).join(' and ');
     stage.innerHTML = `
       <div style="font-size:3rem">✅</div>
       <h2>Nice work!</h2>
-      <p class="muted">This game looked at your <b>${traitNames}</b>.</p>
+      <p class="muted">This game looked at your <b>${traitNames}</b>. Your result is saved.</p>
       <div class="btn-row">
         ${next ? `<button class="btn primary big" id="next">Next: ${next.title}</button>` : `<button class="btn primary big" id="res">See my profile</button>`}
         <button class="btn" id="hubb">All games</button>
@@ -785,32 +905,32 @@
     return `<svg class="radar" viewBox="-95 -10 ${size + 190} ${size + 20}" role="img" aria-label="Trait radar chart">${rings}${axes}${area}${dots}${labels}</svg>`;
   }
 
-  function results() {
-    const prof = buildProfile(state);
-    if (!prof) { show('hub'); return; }
-    const { have, strongest, headline, roles, missing, scores } = prof;
-
-    app.innerHTML = `
+  // Profile page, used by participants (their own) and by the admin (read-only view of anyone).
+  function profileHTML(p, forAdmin) {
+    const prof = buildProfile(p);
+    if (!prof) return null;
+    const { have, strongest, headline, roles, missing } = prof;
+    return `
       <div class="results-head">
         <div>
-          <p class="muted" style="margin:0">${esc(state.name)}’s MindPrint</p>
+          <p class="muted" style="margin:0">${esc(p.name)}’s MindPrint</p>
           <div class="headline">${esc(headline)}</div>
-          <p class="muted" style="margin-top:10px">Your most distinctive traits are <b>${esc(strongest[0].name.toLowerCase())}</b>${strongest[1] ? ` and <b>${esc(strongest[1].name.toLowerCase())}</b>` : ''}. Each trait is a spectrum — both ends are strengths in the right setting.</p>
+          <p class="muted" style="margin-top:10px">${forAdmin ? 'Most distinctive traits' : 'Your most distinctive traits are'} <b>${esc(strongest[0].name.toLowerCase())}</b>${strongest[1] ? ` and <b>${esc(strongest[1].name.toLowerCase())}</b>` : ''}. Each trait is a spectrum — both ends are strengths in the right setting.</p>
           ${missing.length ? `<p class="small">Profile is partial: ${missing.length} game${missing.length > 1 ? 's' : ''} left (${missing.map((g) => g.title).join(', ')}).</p>` : ''}
           <div class="btn-row no-print" style="justify-content:flex-start">
-            ${missing.length ? `<button class="btn primary" id="more">Play remaining games</button>` : ''}
+            ${!forAdmin && missing.length ? `<button class="btn primary" id="more">Play remaining games</button>` : ''}
             <button class="btn" id="dl">Download</button>
             <button class="btn" id="pr">Print / PDF</button>
           </div>
         </div>
-        <div class="card">${have.length >= 3 ? radarSVG(have) : '<p class="muted">Play at least 3 games to see your trait map.</p>'}</div>
+        <div class="card">${have.length >= 3 ? radarSVG(have) : '<p class="muted">Play at least 3 games to see the trait map.</p>'}</div>
       </div>
 
       ${roles.length ? `<section class="section"><h2>Work that tends to fit</h2>
         <p class="muted">People with a similar trait pattern often enjoy these areas. Treat them as ideas to explore, not a verdict.</p>
         <div class="chips">${roles.map((r) => `<span class="chip">${esc(r)}</span>`).join('')}</div></section>` : ''}
 
-      <section class="section"><h2>Your traits</h2>
+      <section class="section"><h2>${forAdmin ? 'Traits' : 'Your traits'}</h2>
         <div class="trait-list">
           ${have.map((t) => `
             <div class="card trait">
@@ -822,41 +942,147 @@
         </div>
       </section>
 
-      <details class="card section"><summary>Game-by-game details</summary>
-        ${GAMES.filter((g) => state.results[g.id]).map((g) => `
-          <h3 style="margin-top:14px">${g.icon} ${g.title}</h3>
-          <table>${Object.entries(state.results[g.id].raw || {}).map(([k, v]) => `<tr><td>${esc(k)}</td><td><b>${esc(v)}</b></td></tr>`).join('')}</table>`).join('')}
-      </details>
-
-      <section class="card section no-print finish-card">
-        <div><h3 style="margin:0">All done?</h3><p class="muted small" style="margin:4px 0 0">Log out so the next person can’t see your profile. Log back in any time with your name and PIN.</p></div>
-        <div class="btn-row" style="margin:0">
-          <button class="btn primary" id="out">Log out</button>
-          <button class="link" id="delp">Delete my profile</button>
-        </div>
-      </section>`;
-
-    const ctx = makeCtx();
-    if (missing.length) ctx.listen($('#more'), 'click', () => show('intro', missing[0].id));
+      <details class="card section" ${forAdmin ? 'open' : ''}><summary>Game-by-game details</summary>
+        ${GAMES.filter((g) => p.results[g.id]).map((g) => `
+          <h3 style="margin-top:14px">${g.icon} ${g.title} <span class="muted small" style="font-weight:400">· ${new Date(p.results[g.id].at).toLocaleString()}</span></h3>
+          <table>${Object.entries(p.results[g.id].raw || {}).map(([k, v]) => `<tr><td>${esc(k)}</td><td><b>${esc(v)}</b></td></tr>`).join('')}</table>`).join('')}
+      </details>`;
+  }
+  function wireProfileButtons(ctx, p) {
     ctx.listen($('#pr'), 'click', () => window.print());
     ctx.listen($('#dl'), 'click', () => {
-      const blob = new Blob([JSON.stringify({ name: state.name, traits: scores, games: state.results, exported: new Date().toISOString() }, null, 2)], { type: 'application/json' });
+      const blob = new Blob([JSON.stringify({ name: p.name, traits: traitScores(p), games: p.results, exported: new Date().toISOString() }, null, 2)], { type: 'application/json' });
       const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob); a.download = `mindprint-${state.name.toLowerCase().replace(/\W+/g, '-')}.json`;
+      a.href = URL.createObjectURL(blob); a.download = `mindprint-${p.name.toLowerCase().replace(/\W+/g, '-')}.json`;
       document.body.appendChild(a); a.click(); a.remove();
-    });
-    ctx.listen($('#out'), 'click', () => { logout(); show('home', 'login'); });
-    ctx.listen($('#delp'), 'click', () => {
-      if (!confirm('Permanently delete your profile and all your results?')) return;
-      deleteProfile(state); show('home');
     });
   }
 
-  // ---------- Nav ----------
-  $('#brand').addEventListener('click', (e) => { e.preventDefault(); show('home'); });
+  function results() {
+    const html = profileHTML(state, false);
+    if (!html) { show('hub'); return; }
+    app.innerHTML = html + `
+      <section class="card section no-print finish-card">
+        <div><h3 style="margin:0">All done?</h3><p class="muted small" style="margin:4px 0 0">Log out so the next person can’t see your profile. Log back in any time with your name and PIN.</p></div>
+        <div class="btn-row" style="margin:0"><button class="btn primary" id="out">Log out</button></div>
+      </section>`;
+    const ctx = makeCtx();
+    const missing = GAMES.filter((g) => !state.results[g.id]);
+    if (missing.length) ctx.listen($('#more'), 'click', () => show('intro', missing[0].id));
+    wireProfileButtons(ctx, state);
+    ctx.listen($('#out'), 'click', async () => { await doLogout(); show('home', 'login'); });
+  }
+
+  // ---------- Admin (view-only) ----------
+  let adminCache = null;
+  async function admin() {
+    if (!Store.online) {
+      app.innerHTML = `<div class="card auth"><h2>Admin</h2><p class="muted">The admin page needs the online database. Follow “Set up the online database” in the README, then come back to this page.</p></div>`;
+      return;
+    }
+    if (!Store.isAdmin) {
+      app.innerHTML = `
+        <div class="auth card" style="margin-top:24px">
+          <h2>Admin login</h2>
+          <form id="al">
+            <label>Email<input class="input" id="ae" type="email" required autocomplete="username"></label>
+            <label>Password<input class="input" id="ap" type="password" required autocomplete="current-password"></label>
+            <div class="feedback bad" id="aerr"></div>
+            <button class="btn primary big" type="submit" id="abtn">Log in</button>
+          </form>
+        </div>`;
+      const ctx = makeCtx();
+      ctx.listen($('#al'), 'submit', async (e) => {
+        e.preventDefault();
+        $('#abtn').disabled = true;
+        state = null;
+        const r = await Store.adminLogin($('#ae').value.trim(), $('#ap').value);
+        if (!ctx.alive()) return;
+        if (r.error) {
+          $('#aerr').textContent = r.error === 'notadmin' ? 'This account is not the admin account.' : r.error === 'slow' ? 'Too many attempts. Wait a few minutes.' : 'Email or password is incorrect.';
+          $('#abtn').disabled = false; return;
+        }
+        adminCache = null; show('admin');
+      });
+      return;
+    }
+    app.innerHTML = '<p class="muted">Loading participants…</p>';
+    const ctx = makeCtx();
+    let people;
+    try { people = adminCache || (adminCache = await Store.listAll()); } catch (e) {
+      app.innerHTML = `<div class="card"><h3>Couldn’t load participants</h3><p class="muted">${esc(e.message || e)}</p><p class="small">Check that the Firestore rules contain your admin UID (see README).</p></div>`;
+      return;
+    }
+    if (!ctx.alive()) return;
+    const complete = people.filter((p) => doneCount(p) === GAMES.length).length;
+    const row = (p) => {
+      const prof = buildProfile(p), s = prof ? prof.scores : {};
+      return `<tr data-id="${esc(p.id)}" data-q="${esc(p.name.toLowerCase())}">
+        <td><b>${esc(p.name)}</b></td>
+        <td>${new Date(p.created).toLocaleDateString()}</td>
+        <td>${doneCount(p)}/${GAMES.length}</td>
+        <td>${prof ? esc(prof.headline) : '<span class="muted">—</span>'}</td>
+        ${TRAITS.map((t) => `<td class="num">${s[t.id] != null ? s[t.id] : ''}</td>`).join('')}
+      </tr>`;
+    };
+    app.innerHTML = `
+      <div class="hub-head">
+        <div><h2>Participants</h2><p class="muted">${people.length} profile${people.length === 1 ? '' : 's'} · ${complete} completed all games. View-only — results can’t be edited.</p></div>
+        <div class="btn-row" style="margin:0"><button class="btn" id="refresh">Refresh</button><button class="btn primary" id="csv">Export CSV</button></div>
+      </div>
+      <input class="input" id="q" placeholder="Search by name" style="width:100%;max-width:none;margin:12px 0" aria-label="Search by name">
+      <div class="card table-wrap">
+        <table class="admin-table">
+          <thead><tr><th>Name</th><th>Joined</th><th>Games</th><th>Headline</th>${TRAITS.map((t) => `<th class="num">${esc(t.name)}</th>`).join('')}</tr></thead>
+          <tbody>${people.map(row).join('') || `<tr><td colspan="${4 + TRAITS.length}" class="muted">No participants yet.</td></tr>`}</tbody>
+        </table>
+      </div>
+      <p class="muted small">Tap a name to see the full profile.</p>`;
+    ctx.listen($('#q'), 'input', () => {
+      const q = $('#q').value.trim().toLowerCase();
+      app.querySelectorAll('tbody tr[data-q]').forEach((tr) => { tr.hidden = q && !tr.dataset.q.includes(q); });
+    });
+    app.querySelectorAll('tbody tr[data-id]').forEach((tr) => ctx.listen(tr, 'click', () => show('adminView', tr.dataset.id)));
+    ctx.listen($('#refresh'), 'click', () => { adminCache = null; show('admin'); });
+    ctx.listen($('#csv'), 'click', () => {
+      const q = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+      const lines = [['Name', 'Joined', 'Games completed', 'Headline', ...TRAITS.map((t) => t.name)].map(q).join(',')];
+      for (const p of people) {
+        const prof = buildProfile(p), s = prof ? prof.scores : {};
+        lines.push([p.name, new Date(p.created).toISOString(), doneCount(p), prof ? prof.headline : '', ...TRAITS.map((t) => s[t.id])].map(q).join(','));
+      }
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob(['﻿' + lines.join('\n')], { type: 'text/csv' }));
+      a.download = `mindprint-participants-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a); a.click(); a.remove();
+    });
+  }
+
+  function adminView(id) {
+    const p = Store.isAdmin && adminCache && adminCache.find((x) => x.id === id);
+    if (!p) { show('admin'); return; }
+    const html = profileHTML(p, true);
+    app.innerHTML = `<div class="btn-row no-print" style="justify-content:flex-start;margin:0 0 16px"><button class="btn" id="back">← All participants</button></div>` +
+      (html || `<div class="card"><h2>${esc(p.name)}</h2><p class="muted">Hasn’t finished any games yet.</p></div>`);
+    const ctx = makeCtx();
+    ctx.listen($('#back'), 'click', () => show('admin'));
+    if (html) wireProfileButtons(ctx, p);
+  }
+
+  // ---------- Nav & start-up ----------
+  $('#brand').addEventListener('click', (e) => { e.preventDefault(); show(Store.isAdmin ? 'admin' : 'home'); });
   $('#nav-games').addEventListener('click', () => show('hub'));
   $('#nav-profile').addEventListener('click', () => show(state && doneCount(state) ? 'results' : 'hub'));
-  $('#nav-logout').addEventListener('click', () => { logout(); show('home', 'login'); });
+  $('#nav-logout').addEventListener('click', async () => { const wasAdmin = Store.isAdmin; await doLogout(); adminCache = null; show(wasAdmin ? 'admin' : 'home', 'login'); });
+  window.addEventListener('hashchange', () => { if (location.hash === '#admin') show('admin'); });
 
-  show(state ? 'hub' : 'home');
+  (async () => {
+    app.innerHTML = '<p class="muted" style="text-align:center;margin-top:60px">Loading…</p>';
+    try { state = await Store.init(); } catch (e) {
+      app.innerHTML = `<div class="card auth"><h3>Can’t connect</h3><p class="muted">Please check your internet connection and reload the page.</p></div>`;
+      console.error(e); return;
+    }
+    if (location.hash === '#admin') show('admin');
+    else show(state ? 'hub' : 'home');
+  })();
 })();

@@ -1,0 +1,40 @@
+rules_version = '2';
+// MindPrint security rules.
+// Paste into Firebase → Firestore Database → Rules, replace PASTE_ADMIN_UID_HERE with your admin User UID, then Publish.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAdmin() {
+      return request.auth != null && request.auth.uid == 'PASTE_ADMIN_UID_HERE';
+    }
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    match /participants/{uid} {
+      // A participant can read only their own profile. The admin can read everyone's.
+      allow read: if isOwner(uid) || isAdmin();
+
+      // A new profile must start empty.
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['name', 'nameKey', 'createdAt', 'results', 'seen'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 30
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.results == {};
+
+      // The owner may only ADD results for games not yet played. Existing results can never be
+      // changed or removed, and name / join date can never change. Nobody else (not even the admin) can write.
+      allow update: if isOwner(uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['results', 'seen'])
+        && request.resource.data.results.diff(resource.data.results).changedKeys().size() == 0
+        && request.resource.data.results.diff(resource.data.results).removedKeys().size() == 0
+        && request.resource.data.results.diff(resource.data.results).addedKeys().size() == 1
+        && request.resource.data.results.diff(resource.data.results).addedKeys()
+             .hasOnly(['balloon', 'trust', 'memory', 'gonogo', 'hanoi', 'emotion', 'effort', 'delay']);
+
+      // Profiles are never deleted from the website.
+      allow delete: if false;
+    }
+  }
+}
