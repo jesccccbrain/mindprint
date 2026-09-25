@@ -213,10 +213,14 @@ td, th { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--bord
   .card { box-shadow: none; }
 }
 
-/* Participants & email */
-.start-form { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
-.people { display: grid; gap: 10px; }
-.person { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 14px 16px; flex-wrap: wrap; }
-.person-actions { display: flex; gap: 6px; align-items: center; }
-.email-card .feedback { margin-top: 8px; }
+/* Private profiles */
+[hidden] { display: none !important; }
+.auth { max-width: 380px; margin: 0 auto; text-align: left; }
+.auth form { display: grid; gap: 12px; }
+.auth label { display: grid; gap: 6px; font-weight: 600; font-size: .9rem; }
+.auth .input { width: 100%; }
+.auth .feedback { min-height: 0; margin: 0; font-size: .9rem; }
+.tabs { display: grid; grid-template-columns: 1fr 1fr; background: var(--surface-2); border-radius: 12px; padding: 4px; margin-bottom: 16px; }
+.tab { font: inherit; font-weight: 600; border: 0; background: none; color: var(--muted); padding: 10px; border-radius: 9px; cursor: pointer; }
+.tab.active { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
 .finish-card { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }

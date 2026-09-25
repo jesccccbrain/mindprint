@@ -6,9 +6,6 @@
   // ---------- Config ----------
   const CUR = '$';               // currency symbol shown in games (e.g. 'RM')
   const STORE_KEY = 'mindprint.v2';
-  // Paste your Google Apps Script web-app URL here to email results automatically (see README).
-  // Leave it empty and the "Email" button opens the participant's own email app instead.
-  const EMAIL_ENDPOINT = '';
 
   // ---------- Helpers ----------
   const app = document.getElementById('app');
@@ -20,32 +17,53 @@
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const $ = (sel, root = document) => root.querySelector(sel);
 
-  // ---------- Storage: several participants per device ----------
-  // db = { current: id | null, people: { id: { id, name, email, results, created } } }
+  // ---------- Storage: private profiles (name + PIN) ----------
+  // db = { people: { id: { id, name, key, salt, pin, results, created } } }
+  // Nobody is logged in when the page opens; the session lives only in this tab (sessionStorage).
   function saveDb() { try { localStorage.setItem(STORE_KEY, JSON.stringify(db)); } catch (e) { /* storage unavailable */ } }
   function loadDb() { try { return JSON.parse(localStorage.getItem(STORE_KEY)); } catch (e) { return null; } }
-  const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-  let db = loadDb() || { current: null, people: {} };
+  const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 9);
+  const nameKey = (s) => s.trim().replace(/\s+/g, ' ').toLowerCase();
+  let db = loadDb() || { people: {} };
   if (!db.people) db.people = {};
-  try { // migrate the old single-profile format
-    const old = JSON.parse(localStorage.getItem('mindprint.v1'));
-    if (old && old.results && Object.keys(old.results).length) {
-      const id = newId();
-      db.people[id] = { id, name: old.name || 'Player', email: '', results: old.results, created: Date.now() };
-    }
-    localStorage.removeItem('mindprint.v1');
-  } catch (e) { /* ignore */ }
-  let state = db.people[db.current] || null;   // the participant currently playing
-  const save = saveDb;
-  function startPerson(name, email) {
-    const id = newId();
-    db.people[id] = { id, name, email, results: {}, created: Date.now() };
-    db.current = id; state = db.people[id]; saveDb();
-  }
-  function switchTo(id) { db.current = id; state = db.people[id] || null; saveDb(); }
-  function endSession() { db.current = null; state = null; saveDb(); }
-  function deletePerson(id) { delete db.people[id]; if (db.current === id) endSession(); else saveDb(); }
+  delete db.current;
+  try { localStorage.removeItem('mindprint.v1'); } catch (e) { /* ignore */ }
+  // Profiles from older versions have no PIN; they are removed so every profile is protected.
+  for (const [id, p] of Object.entries(db.people)) if (!p.pin) delete db.people[id];
   saveDb();
+
+  async function hashPin(pin, salt) {
+    const text = salt + ':' + pin;
+    if (window.crypto && crypto.subtle) {
+      const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+      return Array.from(new Uint8Array(buf)).map((x) => x.toString(16).padStart(2, '0')).join('');
+    }
+    let h = 0; for (let i = 0; i < text.length; i++) h = (Math.imul(31, h) + text.charCodeAt(i)) | 0;
+    return 'x' + (h >>> 0).toString(16);
+  }
+  const findByName = (name) => Object.values(db.people).find((p) => p.key === nameKey(name));
+
+  let state = null; // the logged-in participant
+  try { const sid = sessionStorage.getItem('mindprint.session'); if (sid && db.people[sid]) state = db.people[sid]; } catch (e) { /* ignore */ }
+  const save = saveDb;
+  function setSession(p) {
+    state = p;
+    try { if (p) sessionStorage.setItem('mindprint.session', p.id); else sessionStorage.removeItem('mindprint.session'); } catch (e) { /* ignore */ }
+  }
+  async function createProfile(name, pin) {
+    if (findByName(name)) return false;
+    const id = newId(), salt = newId();
+    db.people[id] = { id, name: name.trim().replace(/\s+/g, ' '), key: nameKey(name), salt, pin: await hashPin(pin, salt), results: {}, created: Date.now() };
+    saveDb(); setSession(db.people[id]);
+    return true;
+  }
+  async function login(name, pin) {
+    const p = findByName(name);
+    if (!p || (await hashPin(pin, p.salt)) !== p.pin) return false;
+    setSession(p); return true;
+  }
+  function logout() { setSession(null); }
+  function deleteProfile(p) { delete db.people[p.id]; saveDb(); setSession(null); }
 
   // Every screen change bumps runId; running games notice and stop.
   let runId = 0;
@@ -500,62 +518,64 @@
 
 
   // ---------- Screens ----------
-  const needsPerson = ['hub', 'intro', 'play', 'results'];
+  const needsLogin = ['hub', 'intro', 'play', 'results'];
   function show(name, arg) {
     teardown();
     window.scrollTo(0, 0);
-    if (needsPerson.includes(name) && !state) name = 'home';
+    if (needsLogin.includes(name) && !state) name = 'home';
+    renderNav();
     ({ home, hub, intro, play, results })[name](arg);
   }
+  function renderNav() {
+    $('#nav-games').hidden = !state;
+    $('#nav-profile').hidden = !state;
+    $('#nav-logout').hidden = !state;
+  }
   const doneCount = (p) => GAMES.filter((g) => p.results[g.id]).length;
-  const validEmail = (s) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
 
-  function home() {
-    const people = Object.values(db.people).sort((a, b) => b.created - a.created);
+  function home(tab) {
+    if (state) { show('hub'); return; }
+    tab = tab || 'new';
     app.innerHTML = `
       <section class="hero">
         <h1>Discover how you think,<br>decide and work.</h1>
         <p class="lead">Play ${GAMES.length} short games based on behavioural science. There are no right or wrong answers — just a clearer picture of your natural traits and the work that fits them.</p>
-        <form class="start-form" id="start">
-          <input class="input" id="name" placeholder="Your name" maxlength="40" required aria-label="Your name">
-          <input class="input" id="email" type="email" placeholder="Email (to receive your results)" maxlength="120" aria-label="Your email">
-          <button class="btn primary big" type="submit">Start the games</button>
-        </form>
-        <p class="muted small" style="margin-top:12px">About 20 minutes in total · play in any order · each new person gets a fresh profile</p>
-      </section>
-      ${people.length ? `
-      <section class="section">
-        <h2>Profiles on this device</h2>
-        <div class="people">
-          ${people.map((p) => `
-            <div class="card person">
-              <div><b>${esc(p.name)}</b><div class="muted small">${doneCount(p)}/${GAMES.length} games · ${new Date(p.created).toLocaleDateString()}</div></div>
-              <div class="person-actions">
-                <button class="btn" data-act="open" data-id="${p.id}">${doneCount(p) === GAMES.length ? 'View profile' : 'Continue'}</button>
-                <button class="link" data-act="del" data-id="${p.id}" aria-label="Delete ${esc(p.name)}">Delete</button>
-              </div>
-            </div>`).join('')}
+        <div class="auth card">
+          <div class="tabs" role="tablist">
+            <button class="tab ${tab === 'new' ? 'active' : ''}" data-tab="new" role="tab">New profile</button>
+            <button class="tab ${tab === 'login' ? 'active' : ''}" data-tab="login" role="tab">Log in</button>
+          </div>
+          <form id="auth" autocomplete="off">
+            <label>Name<input class="input" id="name" maxlength="40" required autocomplete="off"></label>
+            <label>PIN (4–6 digits)<input class="input" id="pin" type="password" inputmode="numeric" pattern="[0-9]{4,6}" minlength="4" maxlength="6" required autocomplete="off"></label>
+            ${tab === 'new' ? '<label>Confirm PIN<input class="input" id="pin2" type="password" inputmode="numeric" maxlength="6" required autocomplete="off"></label>' : ''}
+            <div class="feedback bad" id="err"></div>
+            <button class="btn primary big" type="submit">${tab === 'new' ? 'Create profile & start' : 'Log in'}</button>
+          </form>
+          <p class="muted small" style="margin:12px 0 0">${tab === 'new' ? 'Your PIN keeps your profile private. Remember it — it can’t be recovered.' : 'Log in to see your own profile or continue your games.'}</p>
         </div>
-      </section>` : ''}
+      </section>
       <section class="steps">
-        <div class="card step"><div class="num">1</div><h3>Play the games</h3><p class="muted">Pump balloons, remember numbers, build towers and make money decisions.</p></div>
-        <div class="card step"><div class="num">2</div><h3>See your traits</h3><p class="muted">Your choices map onto 9 traits like risk tolerance, planning, patience and emotional insight.</p></div>
-        <div class="card step"><div class="num">3</div><h3>Get your report</h3><p class="muted">See your profile, role ideas that fit your pattern, and email the report to yourself.</p></div>
+        <div class="card step"><div class="num">1</div><h3>Create your profile</h3><p class="muted">Pick a name and a PIN. Only you can open your results.</p></div>
+        <div class="card step"><div class="num">2</div><h3>Play the games</h3><p class="muted">Pump balloons, remember numbers, build towers and make money decisions.</p></div>
+        <div class="card step"><div class="num">3</div><h3>See your traits</h3><p class="muted">Get a profile of 9 traits and role ideas that fit your pattern.</p></div>
       </section>`;
     const ctx = makeCtx();
-    ctx.listen($('#start'), 'submit', (e) => {
+    app.querySelectorAll('.tab').forEach((t) => ctx.listen(t, 'click', () => show('home', t.dataset.tab)));
+    const err = $('#err');
+    ctx.listen($('#auth'), 'submit', async (e) => {
       e.preventDefault();
-      const name = $('#name').value.trim(), email = $('#email').value.trim();
-      if (!name) return;
-      if (email && !validEmail(email)) { $('#email').focus(); $('#email').setCustomValidity('Please enter a valid email'); $('#email').reportValidity(); return; }
-      startPerson(name, email); show('hub');
+      const name = $('#name').value.trim(), pin = $('#pin').value;
+      err.textContent = '';
+      if (!name) { err.textContent = 'Please enter your name.'; return; }
+      if (!/^[0-9]{4,6}$/.test(pin)) { err.textContent = 'PIN must be 4–6 digits.'; return; }
+      if (tab === 'new') {
+        if ($('#pin2').value !== pin) { err.textContent = 'The two PINs don’t match.'; return; }
+        if (!(await createProfile(name, pin))) { err.textContent = `The name “${name}” is already taken. Please choose a different name, or log in if it’s yours.`; return; }
+      } else if (!(await login(name, pin))) { err.textContent = 'Name or PIN is incorrect.'; $('#pin').value = ''; return; }
+      show(tab === 'login' && doneCount(state) ? 'results' : 'hub');
     });
-    ctx.listen($('#email'), 'input', () => $('#email').setCustomValidity(''));
-    app.querySelectorAll('[data-act]').forEach((b) => ctx.listen(b, 'click', () => {
-      const p = db.people[b.dataset.id];
-      if (b.dataset.act === 'open') { switchTo(p.id); show(doneCount(p) === GAMES.length ? 'results' : 'hub'); }
-      else if (confirm(`Delete ${p.name}'s profile?`)) { deletePerson(p.id); show('home'); }
-    }));
+    $('#name').focus();
   }
 
   function hub() {
@@ -576,11 +596,11 @@
             <span class="pill ${state.results[g.id] ? 'done' : ''}">${state.results[g.id] ? 'Done · replay' : 'Not played'}</span></div>
           </button>`).join('')}
       </div>
-      <div class="btn-row"><button class="link" id="notme">Not ${esc(state.name)}? Start as someone else</button></div>`;
+      <div class="btn-row"><button class="link" id="notme">Not ${esc(state.name)}? Log out</button></div>`;
     const ctx = makeCtx();
     app.querySelectorAll('.game-card').forEach((c) => ctx.listen(c, 'click', () => show('intro', c.dataset.id)));
     ctx.listen($('#toProfile'), 'click', () => show('results'));
-    ctx.listen($('#notme'), 'click', () => { endSession(); show('home'); });
+    ctx.listen($('#notme'), 'click', () => { logout(); show('home', 'login'); });
   }
 
   function intro(id) {
@@ -655,28 +675,6 @@
     const roles = Object.entries(roleW).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([r]) => r);
     return { scores, have, strongest, headline, roles, missing: GAMES.filter((g) => !p.results[g.id]) };
   }
-  function plainTextReport(p, prof) {
-    const lines = [
-      `${p.name}'s MindPrint profile: ${prof.headline}`, '',
-      ...prof.have.map((t) => `${t.name}: ${t.v}/100 (${t.lowLabel} ← → ${t.highLabel})\n  ${describe(t)}`), '',
-    ];
-    if (prof.roles.length) lines.push(`Work that tends to fit: ${prof.roles.join(', ')}`, '');
-    lines.push(`Play again: ${location.href.split('#')[0]}`, '', 'MindPrint is for self-reflection only, not a validated psychometric test.');
-    return lines.join('\n');
-  }
-  async function sendEmail(p, prof, to) {
-    if (EMAIL_ENDPOINT) {
-      const payload = { name: p.name, email: to, scores: prof.scores, site: location.href.split('#')[0] };
-      // text/plain avoids a CORS preflight; Apps Script reads e.postData.contents
-      await fetch(EMAIL_ENDPOINT, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payload) });
-      return 'sent';
-    }
-    const subject = encodeURIComponent(`My MindPrint profile: ${prof.headline}`);
-    const body = encodeURIComponent(plainTextReport(p, prof));
-    window.location.href = `mailto:${encodeURIComponent(to)}?subject=${subject}&body=${body}`;
-    return 'mailto';
-  }
-
   function radarSVG(items) {
     const size = 340, c = size / 2, R = 115, n = items.length;
     if (n < 3) return '';
@@ -717,15 +715,6 @@
         <div class="card">${have.length >= 3 ? radarSVG(have) : '<p class="muted">Play at least 3 games to see your trait map.</p>'}</div>
       </div>
 
-      <section class="card section no-print email-card">
-        <h3>📧 Email my results</h3>
-        <form id="mailf" class="start-form" style="justify-content:flex-start">
-          <input class="input" id="to" type="email" required placeholder="you@example.com" value="${esc(state.email || '')}" aria-label="Email address">
-          <button class="btn primary" type="submit" id="sendb">Send report</button>
-        </form>
-        <div class="feedback" id="mailfb"></div>
-      </section>
-
       ${roles.length ? `<section class="section"><h2>Work that tends to fit</h2>
         <p class="muted">People with a similar trait pattern often enjoy these areas. Treat them as ideas to explore, not a verdict.</p>
         <div class="chips">${roles.map((r) => `<span class="chip">${esc(r)}</span>`).join('')}</div></section>` : ''}
@@ -749,9 +738,9 @@
       </details>
 
       <section class="card section no-print finish-card">
-        <div><h3 style="margin:0">All done?</h3><p class="muted small" style="margin:4px 0 0">Hand the device to the next person. ${esc(state.name)}'s profile stays saved under “Profiles on this device”.</p></div>
+        <div><h3 style="margin:0">All done?</h3><p class="muted small" style="margin:4px 0 0">Log out so the next person can’t see your profile. Log back in any time with your name and PIN.</p></div>
         <div class="btn-row" style="margin:0">
-          <button class="btn primary" id="nextp">Finish &amp; next person</button>
+          <button class="btn primary" id="out">Log out</button>
           <button class="link" id="delp">Delete my profile</button>
         </div>
       </section>`;
@@ -765,25 +754,10 @@
       a.href = URL.createObjectURL(blob); a.download = `mindprint-${state.name.toLowerCase().replace(/\W+/g, '-')}.json`;
       document.body.appendChild(a); a.click(); a.remove();
     });
-    ctx.listen($('#mailf'), 'submit', async (e) => {
-      e.preventDefault();
-      const to = $('#to').value.trim(), fb = $('#mailfb'), btn = $('#sendb');
-      if (!validEmail(to)) { fb.textContent = 'Please enter a valid email.'; fb.className = 'feedback bad'; return; }
-      state.email = to; save();
-      btn.disabled = true; fb.className = 'feedback'; fb.textContent = 'Sending…';
-      try {
-        const how = await sendEmail(state, prof, to);
-        fb.className = 'feedback good';
-        fb.textContent = how === 'sent' ? `Sent to ${to}. Check your inbox (and spam folder) in a minute.` : 'Your email app should open with the report ready — just press Send.';
-      } catch (err) {
-        fb.className = 'feedback bad'; fb.textContent = 'Could not send right now. Please try again, or use Download / Print.';
-      }
-      btn.disabled = false;
-    });
-    ctx.listen($('#nextp'), 'click', () => { endSession(); show('home'); });
+    ctx.listen($('#out'), 'click', () => { logout(); show('home', 'login'); });
     ctx.listen($('#delp'), 'click', () => {
-      if (!confirm('Delete your profile from this device?')) return;
-      deletePerson(state.id); show('home');
+      if (!confirm('Permanently delete your profile and all your results?')) return;
+      deleteProfile(state); show('home');
     });
   }
 
@@ -791,6 +765,7 @@
   $('#brand').addEventListener('click', (e) => { e.preventDefault(); show('home'); });
   $('#nav-games').addEventListener('click', () => show('hub'));
   $('#nav-profile').addEventListener('click', () => show(state && doneCount(state) ? 'results' : 'hub'));
+  $('#nav-logout').addEventListener('click', () => { logout(); show('home', 'login'); });
 
   show(state ? 'hub' : 'home');
 })();
