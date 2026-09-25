@@ -5,7 +5,10 @@
 
   // ---------- Config ----------
   const CUR = '$';               // currency symbol shown in games (e.g. 'RM')
-  const STORE_KEY = 'mindprint.v1';
+  const STORE_KEY = 'mindprint.v2';
+  // Paste your Google Apps Script web-app URL here to email results automatically (see README).
+  // Leave it empty and the "Email" button opens the participant's own email app instead.
+  const EMAIL_ENDPOINT = '';
 
   // ---------- Helpers ----------
   const app = document.getElementById('app');
@@ -17,10 +20,32 @@
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const $ = (sel, root = document) => root.querySelector(sel);
 
-  function load() { try { return JSON.parse(localStorage.getItem(STORE_KEY)); } catch (e) { return null; } }
-  function save() { try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) { /* storage unavailable */ } }
-  let state = load() || { name: '', results: {} };
-  if (!state.results) state.results = {};
+  // ---------- Storage: several participants per device ----------
+  // db = { current: id | null, people: { id: { id, name, email, results, created } } }
+  function saveDb() { try { localStorage.setItem(STORE_KEY, JSON.stringify(db)); } catch (e) { /* storage unavailable */ } }
+  function loadDb() { try { return JSON.parse(localStorage.getItem(STORE_KEY)); } catch (e) { return null; } }
+  const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  let db = loadDb() || { current: null, people: {} };
+  if (!db.people) db.people = {};
+  try { // migrate the old single-profile format
+    const old = JSON.parse(localStorage.getItem('mindprint.v1'));
+    if (old && old.results && Object.keys(old.results).length) {
+      const id = newId();
+      db.people[id] = { id, name: old.name || 'Player', email: '', results: old.results, created: Date.now() };
+    }
+    localStorage.removeItem('mindprint.v1');
+  } catch (e) { /* ignore */ }
+  let state = db.people[db.current] || null;   // the participant currently playing
+  const save = saveDb;
+  function startPerson(name, email) {
+    const id = newId();
+    db.people[id] = { id, name, email, results: {}, created: Date.now() };
+    db.current = id; state = db.people[id]; saveDb();
+  }
+  function switchTo(id) { db.current = id; state = db.people[id] || null; saveDb(); }
+  function endSession() { db.current = null; state = null; saveDb(); }
+  function deletePerson(id) { delete db.people[id]; if (db.current === id) endSession(); else saveDb(); }
+  saveDb();
 
   // Every screen change bumps runId; running games notice and stop.
   let runId = 0;
@@ -473,40 +498,71 @@
     },
   ];
 
+
   // ---------- Screens ----------
+  const needsPerson = ['hub', 'intro', 'play', 'results'];
   function show(name, arg) {
     teardown();
     window.scrollTo(0, 0);
+    if (needsPerson.includes(name) && !state) name = 'home';
     ({ home, hub, intro, play, results })[name](arg);
   }
+  const doneCount = (p) => GAMES.filter((g) => p.results[g.id]).length;
+  const validEmail = (s) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
 
   function home() {
-    const started = Object.keys(state.results).length > 0;
+    const people = Object.values(db.people).sort((a, b) => b.created - a.created);
     app.innerHTML = `
       <section class="hero">
         <h1>Discover how you think,<br>decide and work.</h1>
         <p class="lead">Play ${GAMES.length} short games based on behavioural science. There are no right or wrong answers — just a clearer picture of your natural traits and the work that fits them.</p>
-        <form class="name-row" id="start">
-          <input class="input" id="name" placeholder="Your first name" value="${esc(state.name || '')}" maxlength="40" aria-label="Your first name">
-          <button class="btn primary big" type="submit">${started ? 'Continue' : 'Start the games'}</button>
+        <form class="start-form" id="start">
+          <input class="input" id="name" placeholder="Your name" maxlength="40" required aria-label="Your name">
+          <input class="input" id="email" type="email" placeholder="Email (to receive your results)" maxlength="120" aria-label="Your email">
+          <button class="btn primary big" type="submit">Start the games</button>
         </form>
-        <p class="muted small" style="margin-top:12px">About 20 minutes in total · play in any order · results saved in this browser</p>
+        <p class="muted small" style="margin-top:12px">About 20 minutes in total · play in any order · each new person gets a fresh profile</p>
       </section>
+      ${people.length ? `
+      <section class="section">
+        <h2>Profiles on this device</h2>
+        <div class="people">
+          ${people.map((p) => `
+            <div class="card person">
+              <div><b>${esc(p.name)}</b><div class="muted small">${doneCount(p)}/${GAMES.length} games · ${new Date(p.created).toLocaleDateString()}</div></div>
+              <div class="person-actions">
+                <button class="btn" data-act="open" data-id="${p.id}">${doneCount(p) === GAMES.length ? 'View profile' : 'Continue'}</button>
+                <button class="link" data-act="del" data-id="${p.id}" aria-label="Delete ${esc(p.name)}">Delete</button>
+              </div>
+            </div>`).join('')}
+        </div>
+      </section>` : ''}
       <section class="steps">
         <div class="card step"><div class="num">1</div><h3>Play the games</h3><p class="muted">Pump balloons, remember numbers, build towers and make money decisions.</p></div>
         <div class="card step"><div class="num">2</div><h3>See your traits</h3><p class="muted">Your choices map onto 9 traits like risk tolerance, planning, patience and emotional insight.</p></div>
-        <div class="card step"><div class="num">3</div><h3>Find your fit</h3><p class="muted">Get a profile headline and role ideas that tend to suit people with your pattern.</p></div>
+        <div class="card step"><div class="num">3</div><h3>Get your report</h3><p class="muted">See your profile, role ideas that fit your pattern, and email the report to yourself.</p></div>
       </section>`;
-    const f = $('#start');
     const ctx = makeCtx();
-    ctx.listen(f, 'submit', (e) => { e.preventDefault(); state.name = $('#name').value.trim(); save(); show('hub'); });
+    ctx.listen($('#start'), 'submit', (e) => {
+      e.preventDefault();
+      const name = $('#name').value.trim(), email = $('#email').value.trim();
+      if (!name) return;
+      if (email && !validEmail(email)) { $('#email').focus(); $('#email').setCustomValidity('Please enter a valid email'); $('#email').reportValidity(); return; }
+      startPerson(name, email); show('hub');
+    });
+    ctx.listen($('#email'), 'input', () => $('#email').setCustomValidity(''));
+    app.querySelectorAll('[data-act]').forEach((b) => ctx.listen(b, 'click', () => {
+      const p = db.people[b.dataset.id];
+      if (b.dataset.act === 'open') { switchTo(p.id); show(doneCount(p) === GAMES.length ? 'results' : 'hub'); }
+      else if (confirm(`Delete ${p.name}'s profile?`)) { deletePerson(p.id); show('home'); }
+    }));
   }
 
   function hub() {
-    const done = GAMES.filter((g) => state.results[g.id]).length;
+    const done = doneCount(state);
     app.innerHTML = `
       <div class="hub-head">
-        <div><h2>${state.name ? `Hi ${esc(state.name)}, pick a game` : 'Pick a game'}</h2>
+        <div><h2>Hi ${esc(state.name)}, pick a game</h2>
         <p class="muted">${done}/${GAMES.length} completed. Finish all of them for the fullest profile.</p></div>
         <button class="btn ${done ? 'primary' : ''}" id="toProfile" ${done ? '' : 'disabled'}>See my profile</button>
       </div>
@@ -519,10 +575,12 @@
             <div class="meta"><span class="muted small">~${g.mins} min</span>
             <span class="pill ${state.results[g.id] ? 'done' : ''}">${state.results[g.id] ? 'Done · replay' : 'Not played'}</span></div>
           </button>`).join('')}
-      </div>`;
+      </div>
+      <div class="btn-row"><button class="link" id="notme">Not ${esc(state.name)}? Start as someone else</button></div>`;
     const ctx = makeCtx();
     app.querySelectorAll('.game-card').forEach((c) => ctx.listen(c, 'click', () => show('intro', c.dataset.id)));
     ctx.listen($('#toProfile'), 'click', () => show('results'));
+    ctx.listen($('#notme'), 'click', () => { endSession(); show('home'); });
   }
 
   function intro(id) {
@@ -540,6 +598,7 @@
 
   async function play(id) {
     const g = GAMES.find((x) => x.id === id);
+    const player = state;
     app.innerHTML = `
       <div class="game-shell"><div class="card">
         <div class="game-title"><span class="icon">${g.icon}</span><h2 style="margin:0">${g.title}</h2></div>
@@ -550,7 +609,7 @@
     ctx.listen($('#quit'), 'click', () => show('hub'));
     const stage = $('#stage');
     const res = await g.run(ctx, stage);
-    if (!ctx.alive()) return;
+    if (!ctx.alive() || state !== player) return;
     state.results[id] = { ...res, at: Date.now() };
     save();
     const next = GAMES.find((x) => !state.results[x.id]);
@@ -569,10 +628,53 @@
     ctx2.listen($('#hubb'), 'click', () => show('hub'));
   }
 
-  function traitScores() {
+  // ---------- Profile building ----------
+  function traitScores(p) {
     const out = {};
-    for (const g of Object.values(state.results)) Object.assign(out, g.scores);
+    for (const g of Object.values(p.results)) Object.assign(out, g.scores);
     return out;
+  }
+  function describe(t) {
+    return t.v >= 60 ? t.high : t.v <= 40 ? t.low
+      : `You sit in the balanced middle — you can lean ${t.lowLabel.toLowerCase()} or ${t.highLabel.toLowerCase()} depending on the situation.`;
+  }
+  function buildProfile(p) {
+    const scores = traitScores(p);
+    const have = TRAITS.filter((t) => scores[t.id] != null).map((t) => ({ ...t, v: scores[t.id] }));
+    if (!have.length) return null;
+    const strongest = [...have].sort((a, b) => Math.abs(b.v - 50) - Math.abs(a.v - 50));
+    const adj = (t) => (t.v >= 50 ? t.highAdj : t.lowAdj);
+    const cap = (s) => s[0].toUpperCase() + s.slice(1);
+    const headline = strongest.length >= 2 ? `${cap(adj(strongest[0]))} & ${adj(strongest[1])}` : cap(adj(strongest[0]));
+    const roleW = {};
+    for (const t of have) {
+      const dist = Math.abs(t.v - 50);
+      if (dist < 12) continue;
+      for (const r of (t.v > 50 ? t.highRoles : t.lowRoles)) roleW[r] = (roleW[r] || 0) + dist;
+    }
+    const roles = Object.entries(roleW).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([r]) => r);
+    return { scores, have, strongest, headline, roles, missing: GAMES.filter((g) => !p.results[g.id]) };
+  }
+  function plainTextReport(p, prof) {
+    const lines = [
+      `${p.name}'s MindPrint profile: ${prof.headline}`, '',
+      ...prof.have.map((t) => `${t.name}: ${t.v}/100 (${t.lowLabel} ← → ${t.highLabel})\n  ${describe(t)}`), '',
+    ];
+    if (prof.roles.length) lines.push(`Work that tends to fit: ${prof.roles.join(', ')}`, '');
+    lines.push(`Play again: ${location.href.split('#')[0]}`, '', 'MindPrint is for self-reflection only, not a validated psychometric test.');
+    return lines.join('\n');
+  }
+  async function sendEmail(p, prof, to) {
+    if (EMAIL_ENDPOINT) {
+      const payload = { name: p.name, email: to, scores: prof.scores, site: location.href.split('#')[0] };
+      // text/plain avoids a CORS preflight; Apps Script reads e.postData.contents
+      await fetch(EMAIL_ENDPOINT, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payload) });
+      return 'sent';
+    }
+    const subject = encodeURIComponent(`My MindPrint profile: ${prof.headline}`);
+    const body = encodeURIComponent(plainTextReport(p, prof));
+    window.location.href = `mailto:${encodeURIComponent(to)}?subject=${subject}&body=${body}`;
+    return 'mailto';
   }
 
   function radarSVG(items) {
@@ -595,41 +697,34 @@
   }
 
   function results() {
-    const scores = traitScores();
-    const have = TRAITS.filter((t) => scores[t.id] != null).map((t) => ({ ...t, v: scores[t.id] }));
-    if (!have.length) { show('hub'); return; }
-
-    // Headline from the two most pronounced traits
-    const strongest = [...have].sort((a, b) => Math.abs(b.v - 50) - Math.abs(a.v - 50));
-    const adj = (t) => (t.v >= 50 ? t.highAdj : t.lowAdj);
-    const cap = (s) => s[0].toUpperCase() + s.slice(1);
-    const headline = strongest.length >= 2 ? `${cap(adj(strongest[0]))} & ${adj(strongest[1])}` : cap(adj(strongest[0]));
-
-    // Role ideas: weight each trait's side by how far it is from the middle
-    const roleW = {};
-    for (const t of have) {
-      const dist = Math.abs(t.v - 50);
-      if (dist < 12) continue;
-      for (const r of (t.v > 50 ? t.highRoles : t.lowRoles)) roleW[r] = (roleW[r] || 0) + dist;
-    }
-    const roles = Object.entries(roleW).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([r]) => r);
-    const missing = GAMES.filter((g) => !state.results[g.id]);
+    const prof = buildProfile(state);
+    if (!prof) { show('hub'); return; }
+    const { have, strongest, headline, roles, missing, scores } = prof;
 
     app.innerHTML = `
       <div class="results-head">
         <div>
-          <p class="muted" style="margin:0">${state.name ? esc(state.name) + '’s' : 'Your'} MindPrint</p>
+          <p class="muted" style="margin:0">${esc(state.name)}’s MindPrint</p>
           <div class="headline">${esc(headline)}</div>
           <p class="muted" style="margin-top:10px">Your most distinctive traits are <b>${esc(strongest[0].name.toLowerCase())}</b>${strongest[1] ? ` and <b>${esc(strongest[1].name.toLowerCase())}</b>` : ''}. Each trait is a spectrum — both ends are strengths in the right setting.</p>
           ${missing.length ? `<p class="small">Profile is partial: ${missing.length} game${missing.length > 1 ? 's' : ''} left (${missing.map((g) => g.title).join(', ')}).</p>` : ''}
           <div class="btn-row no-print" style="justify-content:flex-start">
             ${missing.length ? `<button class="btn primary" id="more">Play remaining games</button>` : ''}
-            <button class="btn" id="dl">Download results</button>
-            <button class="btn" id="pr">Print / Save PDF</button>
+            <button class="btn" id="dl">Download</button>
+            <button class="btn" id="pr">Print / PDF</button>
           </div>
         </div>
         <div class="card">${have.length >= 3 ? radarSVG(have) : '<p class="muted">Play at least 3 games to see your trait map.</p>'}</div>
       </div>
+
+      <section class="card section no-print email-card">
+        <h3>📧 Email my results</h3>
+        <form id="mailf" class="start-form" style="justify-content:flex-start">
+          <input class="input" id="to" type="email" required placeholder="you@example.com" value="${esc(state.email || '')}" aria-label="Email address">
+          <button class="btn primary" type="submit" id="sendb">Send report</button>
+        </form>
+        <div class="feedback" id="mailfb"></div>
+      </section>
 
       ${roles.length ? `<section class="section"><h2>Work that tends to fit</h2>
         <p class="muted">People with a similar trait pattern often enjoy these areas. Treat them as ideas to explore, not a verdict.</p>
@@ -642,7 +737,7 @@
               <div class="trait-top"><h3 style="margin:0">${esc(t.name)}</h3><span class="muted small">${t.v}/100</span></div>
               <div class="spectrum"><div class="marker" style="left:${t.v}%"></div></div>
               <div class="ends"><span>${esc(t.lowLabel)}</span><span>${esc(t.highLabel)}</span></div>
-              <p style="margin:10px 0 0">${esc(t.v >= 60 ? t.high : t.v <= 40 ? t.low : `You sit in the balanced middle — you can lean ${t.lowLabel.toLowerCase()} or ${t.highLabel.toLowerCase()} depending on the situation.`)}</p>
+              <p style="margin:10px 0 0">${esc(describe(t))}</p>
             </div>`).join('')}
         </div>
       </section>
@@ -653,7 +748,13 @@
           <table>${Object.entries(state.results[g.id].raw || {}).map(([k, v]) => `<tr><td>${esc(k)}</td><td><b>${esc(v)}</b></td></tr>`).join('')}</table>`).join('')}
       </details>
 
-      <div class="btn-row no-print section"><button class="link" id="reset">Clear my results and start over</button></div>`;
+      <section class="card section no-print finish-card">
+        <div><h3 style="margin:0">All done?</h3><p class="muted small" style="margin:4px 0 0">Hand the device to the next person. ${esc(state.name)}'s profile stays saved under “Profiles on this device”.</p></div>
+        <div class="btn-row" style="margin:0">
+          <button class="btn primary" id="nextp">Finish &amp; next person</button>
+          <button class="link" id="delp">Delete my profile</button>
+        </div>
+      </section>`;
 
     const ctx = makeCtx();
     if (missing.length) ctx.listen($('#more'), 'click', () => show('intro', missing[0].id));
@@ -661,19 +762,35 @@
     ctx.listen($('#dl'), 'click', () => {
       const blob = new Blob([JSON.stringify({ name: state.name, traits: scores, games: state.results, exported: new Date().toISOString() }, null, 2)], { type: 'application/json' });
       const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob); a.download = `mindprint-${(state.name || 'results').toLowerCase().replace(/\W+/g, '-')}.json`;
+      a.href = URL.createObjectURL(blob); a.download = `mindprint-${state.name.toLowerCase().replace(/\W+/g, '-')}.json`;
       document.body.appendChild(a); a.click(); a.remove();
     });
-    ctx.listen($('#reset'), 'click', () => {
-      if (!confirm('Clear all results?')) return;
-      state = { name: '', results: {} }; save(); show('home');
+    ctx.listen($('#mailf'), 'submit', async (e) => {
+      e.preventDefault();
+      const to = $('#to').value.trim(), fb = $('#mailfb'), btn = $('#sendb');
+      if (!validEmail(to)) { fb.textContent = 'Please enter a valid email.'; fb.className = 'feedback bad'; return; }
+      state.email = to; save();
+      btn.disabled = true; fb.className = 'feedback'; fb.textContent = 'Sending…';
+      try {
+        const how = await sendEmail(state, prof, to);
+        fb.className = 'feedback good';
+        fb.textContent = how === 'sent' ? `Sent to ${to}. Check your inbox (and spam folder) in a minute.` : 'Your email app should open with the report ready — just press Send.';
+      } catch (err) {
+        fb.className = 'feedback bad'; fb.textContent = 'Could not send right now. Please try again, or use Download / Print.';
+      }
+      btn.disabled = false;
+    });
+    ctx.listen($('#nextp'), 'click', () => { endSession(); show('home'); });
+    ctx.listen($('#delp'), 'click', () => {
+      if (!confirm('Delete your profile from this device?')) return;
+      deletePerson(state.id); show('home');
     });
   }
 
   // ---------- Nav ----------
   $('#brand').addEventListener('click', (e) => { e.preventDefault(); show('home'); });
   $('#nav-games').addEventListener('click', () => show('hub'));
-  $('#nav-profile').addEventListener('click', () => show(Object.keys(state.results).length ? 'results' : 'hub'));
+  $('#nav-profile').addEventListener('click', () => show(state && doneCount(state) ? 'results' : 'hub'));
 
-  show('home');
+  show(state ? 'hub' : 'home');
 })();
